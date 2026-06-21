@@ -2,30 +2,34 @@ import math
 from collections import namedtuple
 from collections.abc import Iterable, Iterator, Mapping
 from types import MappingProxyType
-from typing import Any, NamedTuple, Self
-
-ProductItem = NamedTuple
+from typing import Any, Self
 
 
 class ProductIterator:
     """Stateful, splittable Cartesian product iterator.
 
-    `ProductIterator` behaves like a labeled version of `itertools.product`,
-    but supports stateful splitting. When split, outer dimensions are removed
-    from the active iteration space and carried as fixed context.
+    This class behaves like a labeled `itertools.product`, but supports:
+
+    * namedtuple output
+    * fixed context from previous splits
+    * recursive outer splitting
+    * flat index lookup
+    * chunking and partitioning through `ProductIterator` views
 
     Example:
-        >>> pi = ProductIterator(a=["x", "y"], b=[1, 2, 3])
+        >>> pi = ProductIterator(a=["x", "y"], b=[1, 2])
         >>> list(pi)
-        [ProductItem(a='x', b=1), ProductItem(a='x', b=2), ...]
+        [ProductItem(a='x', b=1), ProductItem(a='x', b=2),
+         ProductItem(a='y', b=1), ProductItem(a='y', b=2)]
 
     Example:
         Recursive splitting:
+
         >>> pi = ProductIterator(a=["x", "y"], b=[1, 2])
         >>> for sub_a in pi.yield_outer():
-        ...     print(sub_a.context)
+        ...     print(dict(sub_a.context))
         ...     for sub_b in sub_a.yield_outer():
-        ...         print(sub_b.context, list(sub_b))
+        ...         print(dict(sub_b.context), list(sub_b))
         {'a': 'x'}
         {'a': 'x', 'b': 1} [ProductItem(a='x', b=1)]
         {'a': 'x', 'b': 2} [ProductItem(a='x', b=2)]
@@ -36,27 +40,31 @@ class ProductIterator:
 
     def __init__(
         self,
-        fixed: Mapping[str, Any] | None = None,
-        last_fixed_key: str | None = None,
+        _fixed: Mapping[str, Any] | None = None,
+        _last_fixed_key: str | None = None,
+        _start: int = 0,
+        _stop: int | None = None,
         **kwargs: Iterable[Any],
     ) -> None:
         """Initialize the product iterator.
 
         Args:
-            fixed: Internal fixed context carried by child iterators.
-            last_fixed_key: Internal key most recently fixed by `split`.
-            **kwargs: Named dimensions to include in the product.
+            _fixed: Internal fixed context carried by split/view children.
+            _last_fixed_key: Internal key most recently fixed by a split.
+            _start: Internal inclusive flat start index for this view.
+            _stop: Internal exclusive flat stop index for this view.
+            **kwargs: Named iterable dimensions.
 
         Raises:
-            ValueError: If no dimensions/context are provided, or if any
-                iterable dimension is empty.
+            ValueError: If no dimensions/context are provided, if any dimension
+                is empty, or if the flat view bounds are invalid.
 
         Example:
             >>> pi = ProductIterator(a=["x", "y"], b=[1, 2])
             >>> next(iter(pi))
             ProductItem(a='x', b=1)
         """
-        if not kwargs and not fixed:
+        if not kwargs and not _fixed:
             raise ValueError("Must provide at least one dimension")
 
         self._keys: list[str] = list(kwargs.keys())
@@ -69,18 +77,26 @@ class ProductIterator:
         if any(length == 0 for length in self._lengths):
             raise ValueError("All iterables must be non-empty")
 
+        self._fixed: dict[str, Any] = dict(_fixed or {})
+        self._last_fixed_key: str | None = _last_fixed_key
+
         self._value_to_index: dict[str, dict[Any, int]] = {
             key: {value: i for i, value in enumerate(values)}
             for key, values in zip(self._keys, self._values, strict=False)
         }
 
-        self._fixed: dict[str, Any] = dict(fixed or {})
-        self._last_fixed_key: str | None = last_fixed_key
-
-        self._indices: list[int] = [0] * len(self._keys)
-        self._done: bool = False
-        self._active_outer: bool = False
         self._tuple_type: type[tuple[Any, ...]] | None = None
+        self._active_split: bool = False
+
+        total = self._full_size()
+        stop = total if _stop is None else _stop
+
+        if _start < 0 or stop < _start or stop > total:
+            raise ValueError("Invalid view bounds")
+
+        self._start: int = _start
+        self._stop: int = stop
+        self._pos: int = _start
 
     @property
     def context(self) -> Mapping[str, Any]:
@@ -144,6 +160,91 @@ class ProductIterator:
             return None
         return self._fixed[self._last_fixed_key]
 
+    @property
+    def start(self) -> int:
+        """Inclusive flat start index for this iterator view.
+
+        Returns:
+            The inclusive flat start index.
+
+        Example:
+            >>> pi = ProductIterator(a=["x", "y"], b=[1, 2])
+            >>> chunk = next(pi.chunk(2))
+            >>> chunk.start
+            0
+        """
+        return self._start
+
+    @property
+    def stop(self) -> int:
+        """Exclusive flat stop index for this iterator view.
+
+        Returns:
+            The exclusive flat stop index.
+
+        Example:
+            >>> pi = ProductIterator(a=["x", "y"], b=[1, 2])
+            >>> chunk = next(pi.chunk(2))
+            >>> chunk.stop
+            2
+        """
+        return self._stop
+
+    @property
+    def pos(self) -> int:
+        """Current flat cursor position for this iterator view.
+
+        Returns:
+            The current flat cursor position.
+
+        Example:
+            >>> pi = ProductIterator(a=["x"], b=[1, 2])
+            >>> pi.pos
+            0
+        """
+        return self._pos
+
+    def _full_size(self) -> int:
+        """Return the total active product size, ignoring view bounds.
+
+        Returns:
+            Total number of active combinations.
+        """
+        return math.prod(self._lengths) if self._lengths else 1
+
+    @property
+    def size(self) -> int:
+        """Return the size of this iterator view.
+
+        Fixed context values do not contribute to size.
+
+        Returns:
+            Number of items in this iterator's flat view.
+
+        Example:
+            >>> ProductIterator(a=["x", "y"], b=[1, 2, 3]).size()
+            6
+            >>> next(ProductIterator(a=["x", "y"], b=[1, 2, 3]).chunk(2)).size()
+            2
+        """
+        return self._stop - self._start
+
+    @property
+    def remaining(self) -> int:
+        """Return the number of items remaining from the current cursor.
+
+        Returns:
+            Number of unconsumed items in this iterator view.
+
+        Example:
+            >>> pi = ProductIterator(a=["x"], b=[1, 2])
+            >>> next(iter(pi))
+            ProductItem(a='x', b=1)
+            >>> pi.remaining()
+            1
+        """
+        return self._stop - self._pos
+
     def _make_tuple(self, active: Mapping[str, Any]) -> tuple[Any, ...]:
         """Create a namedtuple result from fixed and active values.
 
@@ -160,166 +261,35 @@ class ProductIterator:
 
         return self._tuple_type(**full)
 
-    def _current(self) -> tuple[Any, ...]:
-        """Return the current product item.
-
-        Returns:
-            The current product item as a namedtuple.
-        """
-        active = {
-            key: self._values[i][idx]
-            for i, (key, idx) in enumerate(zip(self._keys, self._indices, strict=False))
-        }
-        return self._make_tuple(active)
-
-    def _advance(self) -> None:
-        """Advance the internal state by one product item."""
-        if self._done:
-            return
-
-        for i in reversed(range(len(self._indices))):
-            self._indices[i] += 1
-
-            if self._indices[i] < self._lengths[i]:
-                for j in range(i + 1, len(self._indices)):
-                    self._indices[j] = 0
-                return
-
-            self._indices[i] = 0
-
-        self._done = True
-
-    def __iter__(self) -> Iterator[tuple[Any, ...]]:
-        """Iterate over remaining product items.
-
-        Yields:
-            Namedtuple product items.
-
-        Raises:
-            RuntimeError: If a split iterator is currently active.
-
-        Example:
-            >>> pi = ProductIterator(a=["x"], b=[1, 2])
-            >>> list(pi)
-            [ProductItem(a='x', b=1), ProductItem(a='x', b=2)]
-        """
-        if self._active_outer:
-            raise RuntimeError("Cannot iterate while split is active")
-
-        while not self._done:
-            yield self._current()
-            self._advance()
-
-    def reset(self) -> None:
-        """Reset this iterator back to the beginning.
-
-        Raises:
-            RuntimeError: If a split iterator is currently active.
-
-        Example:
-            >>> pi = ProductIterator(a=["x"], b=[1])
-            >>> list(pi)
-            [ProductItem(a='x', b=1)]
-            >>> pi.reset()
-            >>> list(pi)
-            [ProductItem(a='x', b=1)]
-        """
-        if self._active_outer:
-            raise RuntimeError("Cannot reset while split is active")
-
-        self._indices = [0 for _ in self._keys]
-        self._done = False
-
-    def yield_outer(self) -> Iterator[Self]:
-        """Split on the current outermost active dimension.
-
-        Returns:
-            An iterator of child `ProductIterator` objects.
-
-        Example:
-            >>> pi = ProductIterator(a=["x", "y"], b=[1, 2])
-            >>> sub = next(pi.yield_outer())
-            >>> dict(sub.context)
-            {'a': 'x'}
-            >>> list(sub)
-            [ProductItem(a='x', b=1), ProductItem(a='x', b=2)]
-        """
-        return self.split(depth=1)
-
-    def split(self, depth: int = 1) -> Iterator[Self]:
-        """Split by fixing the first `depth` active dimensions.
+    def _unravel_index(self, idx: int) -> list[int]:
+        """Convert a flat product index into a multi-index.
 
         Args:
-            depth: Number of active dimensions to fix.
-
-        Yields:
-            Child `ProductIterator` instances with fixed context expanded and
-            those dimensions removed from the active iteration space.
-
-        Raises:
-            ValueError: If `depth` is invalid.
-            RuntimeError: If another split is already active.
-
-        Example:
-            >>> pi = ProductIterator(a=["x"], b=[1, 2], c=["p", "q"])
-            >>> sub = next(pi.split(depth=2))
-            >>> dict(sub.context)
-            {'a': 'x', 'b': 1}
-            >>> list(sub)
-            [ProductItem(a='x', b=1, c='p'), ProductItem(a='x', b=1, c='q')]
-        """
-        if depth <= 0 or depth > len(self._keys):
-            raise ValueError("Invalid depth")
-
-        if self._active_outer:
-            raise RuntimeError("Split already active")
-
-        if self._done:
-            return iter(())
-
-        self._active_outer = True
-
-        def generator() -> Iterator[Self]:
-            try:
-                while not self._done:
-                    prefix_indices = self._indices[:depth]
-
-                    new_fixed = dict(self._fixed)
-                    new_kwargs: dict[str, Iterable[Any]] = {}
-
-                    for i, key in enumerate(self._keys):
-                        if i < depth:
-                            new_fixed[key] = self._values[i][prefix_indices[i]]
-                        else:
-                            new_kwargs[key] = self._values[i]
-
-                    yield ProductIterator(
-                        _fixed=new_fixed,
-                        _last_fixed_key=self._keys[depth - 1],
-                        **new_kwargs,
-                    )
-
-                    while not self._done and self._indices[:depth] == prefix_indices:
-                        self._advance()
-
-            finally:
-                self._active_outer = False
-
-        return generator()
-
-    def size(self) -> int:
-        """Return the number of active combinations.
-
-        Fixed context values do not contribute to size.
+            idx: Flat product index relative to the full active product space.
 
         Returns:
-            Number of combinations remaining in this iterator's active space.
+            Per-dimension integer indices.
+
+        Raises:
+            IndexError: If `idx` is out of bounds.
 
         Example:
-            >>> ProductIterator(a=["x", "y"], b=[1, 2, 3]).size()
-            6
+            >>> pi = ProductIterator(a=["x", "y"], b=[1, 2, 3])
+            >>> pi._unravel_index(4)
+            [1, 1]
         """
-        return math.prod(self._lengths) if self._lengths else 1
+        total = self._full_size()
+
+        if idx < 0 or idx >= total:
+            raise IndexError("Flat index out of bounds")
+
+        indices: list[int] = []
+
+        for length in reversed(self._lengths):
+            indices.append(idx % length)
+            idx //= length
+
+        return list(reversed(indices))
 
     def _ravel_index(self, indices: Iterable[int]) -> int:
         """Convert a multi-index into a flat product index.
@@ -328,16 +298,22 @@ class ProductIterator:
             indices: Per-dimension integer indices.
 
         Returns:
-            Flat product index.
+            Flat product index relative to the full active product space.
+
+        Raises:
+            ValueError: If the number of indices is wrong.
+            IndexError: If any dimension index is out of bounds.
 
         Example:
-            For lengths `[2, 3, 2]`, index `[0, 1, 1]` becomes `3`.
+            For dimensions with lengths `[2, 3, 2]`, index `[0, 1, 1]`
+            becomes `3`.
         """
-        idx = 0
         indices_list = list(indices)
 
         if len(indices_list) != len(self._lengths):
             raise ValueError("Incorrect number of indices")
+
+        idx = 0
 
         for i, value in enumerate(indices_list):
             if value < 0 or value >= self._lengths[i]:
@@ -348,6 +324,123 @@ class ProductIterator:
 
         return idx
 
+    def item_at(self, idx: int) -> tuple[Any, ...]:
+        """Return the product item at a flat index.
+
+        Args:
+            idx: Flat index relative to the full active product space.
+
+        Returns:
+            Namedtuple product item.
+
+        Raises:
+            IndexError: If `idx` is out of bounds.
+
+        Example:
+            >>> pi = ProductIterator(a=["x", "y"], b=[1, 2, 3])
+            >>> pi.item_at(4)
+            ProductItem(a='y', b=2)
+        """
+        multi_idx = self._unravel_index(idx)
+
+        active = {
+            self._keys[i]: self._values[i][multi_idx[i]] for i in range(len(multi_idx))
+        }
+
+        return self._make_tuple(active)
+
+    @property
+    def current(self) -> tuple[Any, ...]:
+        """Return the current item without advancing.
+
+        Returns:
+            Current namedtuple product item.
+
+        Raises:
+            StopIteration: If this iterator view is exhausted.
+
+        Example:
+            >>> pi = ProductIterator(a=["x"], b=[1, 2])
+            >>> pi.current()
+            ProductItem(a='x', b=1)
+        """
+        if self._pos >= self._stop:
+            raise StopIteration
+
+        return self.item_at(self._pos)
+
+    def __iter__(self) -> Iterator[tuple[Any, ...]]:
+        """Iterate over remaining product items in this view.
+
+        Yields:
+            Namedtuple product items.
+
+        Raises:
+            RuntimeError: If a stateful split is currently active.
+
+        Example:
+            >>> pi = ProductIterator(a=["x"], b=[1, 2])
+            >>> list(pi)
+            [ProductItem(a='x', b=1), ProductItem(a='x', b=2)]
+        """
+        if self._active_split:
+            raise RuntimeError("Cannot iterate while split is active")
+
+        while self._pos < self._stop:
+            yield self.item_at(self._pos)
+            self._pos += 1
+
+    def reset(self) -> None:
+        """Reset this iterator view back to its start index.
+
+        Raises:
+            RuntimeError: If a stateful split is currently active.
+
+        Example:
+            >>> pi = ProductIterator(a=["x"], b=[1])
+            >>> list(pi)
+            [ProductItem(a='x', b=1)]
+            >>> pi.reset()
+            >>> list(pi)
+            [ProductItem(a='x', b=1)]
+        """
+        if self._active_split:
+            raise RuntimeError("Cannot reset while split is active")
+
+        self._pos = self._start
+
+    def view(self, start: int, stop: int) -> Self:
+        """Create an independent bounded view over this iterator's active space.
+
+        The returned iterator has its own cursor. Consuming the view does not
+        mutate this iterator.
+
+        Args:
+            start: Inclusive flat start index relative to this iterator's full
+                active product space.
+            stop: Exclusive flat stop index relative to this iterator's full
+                active product space.
+
+        Returns:
+            A new `ProductIterator` with the same active dimensions and fixed
+            context, bounded to `[start, stop)`.
+
+        Raises:
+            ValueError: If the view bounds are invalid.
+
+        Example:
+            >>> pi = ProductIterator(a=["x", "y"], b=[1, 2])
+            >>> list(pi.view(1, 3))
+            [ProductItem(a='x', b=2), ProductItem(a='y', b=1)]
+        """
+        return ProductIterator(
+            _fixed=self._fixed,
+            _last_fixed_key=self._last_fixed_key,
+            _start=start,
+            _stop=stop,
+            **dict(zip(self._keys, self._values, strict=False)),
+        )
+
     def index_of(self, **kwargs: Any) -> int:
         """Compute the flat product index for active dimension values.
 
@@ -355,11 +448,10 @@ class ProductIterator:
             **kwargs: Values for each active dimension.
 
         Returns:
-            Flat index relative to this iterator's active product space.
+            Flat index relative to this iterator's full active product space.
 
         Raises:
-            KeyError: If a required active key is missing.
-            ValueError: If extra keys are provided.
+            ValueError: If required keys are missing or extra keys are provided.
             KeyError: If a value is not present in its dimension.
 
         Example:
@@ -383,44 +475,97 @@ class ProductIterator:
 
         return self._ravel_index(indices)
 
-    def _unravel_index(self, idx: int) -> list[int]:
-        """Convert a flat product index into a multi-index.
-
-        Args:
-            idx: Flat product index.
+    def yield_outer(self) -> Iterator[Self]:
+        """Split on the current outermost active dimension.
 
         Returns:
-            Per-dimension integer indices.
-
-        Raises:
-            IndexError: If `idx` is out of bounds.
+            An iterator of child `ProductIterator` objects.
 
         Example:
-            >>> pi = ProductIterator(a=["x", "y"], b=[1, 2, 3])
-            >>> pi._unravel_index(4)
-            [1, 1]
+            >>> pi = ProductIterator(a=["x", "y"], b=[1, 2])
+            >>> sub = next(pi.yield_outer())
+            >>> dict(sub.context)
+            {'a': 'x'}
+            >>> list(sub)
+            [ProductItem(a='x', b=1), ProductItem(a='x', b=2)]
         """
-        total = self.size()
+        return self.split(depth=1)
 
-        if idx < 0 or idx >= total:
-            raise IndexError("Flat index out of bounds")
+    def split(self, depth: int = 1) -> Iterator[Self]:
+        """Split by fixing the first `depth` active dimensions.
 
-        indices: list[int] = []
-
-        for length in reversed(self._lengths):
-            indices.append(idx % length)
-            idx //= length
-
-        return list(reversed(indices))
-
-    def chunk(self, chunk_size: int) -> Iterator["ProductSlice"]:
-        """Split the active product space into fixed-size slices.
+        Split children remove the fixed dimensions from their active iteration
+        space and carry them as context. This means repeated `yield_outer()`
+        calls naturally progress deeper through the original dimensions.
 
         Args:
-            chunk_size: Maximum number of items per slice.
+            depth: Number of active dimensions to fix.
 
         Yields:
-            `ProductSlice` objects.
+            Child `ProductIterator` instances.
+
+        Raises:
+            ValueError: If `depth` is invalid.
+            RuntimeError: If another split is already active.
+
+        Example:
+            >>> pi = ProductIterator(a=["x"], b=[1, 2], c=["p", "q"])
+            >>> sub = next(pi.split(depth=2))
+            >>> dict(sub.context)
+            {'a': 'x', 'b': 1}
+            >>> list(sub)
+            [ProductItem(a='x', b=1, c='p'), ProductItem(a='x', b=1, c='q')]
+        """
+        if depth <= 0 or depth > len(self._keys):
+            raise ValueError("Invalid depth")
+
+        if self._active_split:
+            raise RuntimeError("Split already active")
+
+        if self._pos >= self._stop:
+            return iter(())
+
+        self._active_split = True
+
+        def generator() -> Iterator[Self]:
+            try:
+                while self._pos < self._stop:
+                    prefix_indices = self._unravel_index(self._pos)[:depth]
+
+                    new_fixed = dict(self._fixed)
+                    new_kwargs: dict[str, Iterable[Any]] = {}
+
+                    for i, key in enumerate(self._keys):
+                        if i < depth:
+                            new_fixed[key] = self._values[i][prefix_indices[i]]
+                        else:
+                            new_kwargs[key] = self._values[i]
+
+                    yield ProductIterator(
+                        _fixed=new_fixed,
+                        _last_fixed_key=self._keys[depth - 1],
+                        **new_kwargs,
+                    )
+
+                    while self._pos < self._stop:
+                        current_prefix = self._unravel_index(self._pos)[:depth]
+                        if current_prefix != prefix_indices:
+                            break
+                        self._pos += 1
+
+            finally:
+                self._active_split = False
+
+        return generator()
+
+    def chunk(self, chunk_size: int) -> Iterator[Self]:
+        """Split this view into fixed-size independent iterator views.
+
+        Args:
+            chunk_size: Maximum number of items per chunk.
+
+        Yields:
+            Independent `ProductIterator` views.
 
         Raises:
             ValueError: If `chunk_size <= 0`.
@@ -428,98 +573,47 @@ class ProductIterator:
         Example:
             >>> pi = ProductIterator(a=["x", "y"], b=[1, 2, 3])
             >>> [list(chunk) for chunk in pi.chunk(2)]
-            [[ProductItem(a='x', b=1), ProductItem(a='x', b=2)], ...]
+            [[ProductItem(a='x', b=1), ProductItem(a='x', b=2)],
+             [ProductItem(a='x', b=3), ProductItem(a='y', b=1)],
+             [ProductItem(a='y', b=2), ProductItem(a='y', b=3)]]
         """
         if chunk_size <= 0:
             raise ValueError("chunk_size must be > 0")
 
-        total = self.size()
+        for start in range(self._start, self._stop, chunk_size):
+            stop = min(start + chunk_size, self._stop)
+            yield self.view(start, stop)
 
-        for start in range(0, total, chunk_size):
-            yield ProductSlice(self, start, min(start + chunk_size, total))
-
-    def partition(self, k: int) -> Iterator["ProductSlice"]:
-        """Partition the active product space into up to `k` slices.
+    def partition(self, k: int) -> Iterator[Self]:
+        """Partition this view into up to `k` independent iterator views.
 
         Args:
             k: Number of desired partitions.
 
         Yields:
-            `ProductSlice` objects with roughly equal sizes.
+            Independent `ProductIterator` views with roughly equal sizes.
 
         Raises:
             ValueError: If `k <= 0`.
 
         Example:
             >>> pi = ProductIterator(a=["x", "y"], b=[1, 2, 3])
-            >>> parts = list(pi.partition(3))
-            >>> [list(part) for part in parts]
-            [[ProductItem(a='x', b=1), ProductItem(a='x', b=2)], ...]
+            >>> [list(part) for part in pi.partition(3)]
+            [[ProductItem(a='x', b=1), ProductItem(a='x', b=2)],
+             [ProductItem(a='x', b=3), ProductItem(a='y', b=1)],
+             [ProductItem(a='y', b=2), ProductItem(a='y', b=3)]]
         """
         if k <= 0:
             raise ValueError("k must be > 0")
 
-        total = self.size()
+        total = self.size
         chunk_size = (total + k - 1) // k
 
         for i in range(k):
-            start = i * chunk_size
-            end = min(start + chunk_size, total)
+            start = self._start + i * chunk_size
+            stop = min(start + chunk_size, self._stop)
 
-            if start >= total:
+            if start >= self._stop:
                 break
 
-            yield ProductSlice(self, start, end)
-
-
-class ProductSlice:
-    """Stateless slice of a `ProductIterator`.
-
-    A `ProductSlice` represents a range of flat product indices. It does not
-    mutate the parent iterator's state.
-
-    Example:
-        >>> pi = ProductIterator(a=["x", "y"], b=[1, 2, 3])
-        >>> slice_ = ProductSlice(pi, 1, 3)
-        >>> list(slice_)
-        [ProductItem(a='x', b=2), ProductItem(a='x', b=3)]
-    """
-
-    def __init__(self, parent: ProductIterator, start: int, end: int) -> None:
-        """Initialize the product slice.
-
-        Args:
-            parent: Source product iterator.
-            start: Inclusive flat start index.
-            end: Exclusive flat end index.
-
-        Raises:
-            ValueError: If the slice bounds are invalid.
-        """
-        if start < 0 or end < start or end > parent.size():
-            raise ValueError("Invalid slice bounds")
-
-        self._parent: ProductIterator = parent
-        self._start: int = start
-        self._end: int = end
-
-    def __iter__(self) -> Iterator[tuple[Any, ...]]:
-        """Iterate over this slice.
-
-        Yields:
-            Namedtuple product items.
-
-        Example:
-            >>> pi = ProductIterator(a=["x"], b=[1, 2])
-            >>> list(ProductSlice(pi, 0, 1))
-            [ProductItem(a='x', b=1)]
-        """
-        for idx in range(self._start, self._end):
-            multi_idx = self._parent._unravel_index(idx)
-
-            active = {
-                self._parent._keys[i]: self._parent._values[i][multi_idx[i]]
-                for i in range(len(multi_idx))
-            }
-
-            yield self._parent._make_tuple(active)
+            yield self.view(start, stop)
